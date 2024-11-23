@@ -1,0 +1,1180 @@
+//RestResource (Receives Information from WhatsApp)
+
+@RestResource(urlMapping='/whatsapp/webhooks/v1/*')
+global without sharing class WhatsAppRest {
+  @HttpGet
+  global static void doGet() {
+    //The request that is sent from WhatsApp to Salesforce with headers in GET METHOD
+    RestRequest request = RestContext.request;
+    System.debug('doGet ' + request);
+    //The response that is sent from Salesforce to WhatsApp with headers required value for WhatsApp in GET METHOD
+    RestResponse response = RestContext.response;
+    System.debug('doGet ' + response);
+    if (
+      request.params.get('hub.verify_token') == System.label.WHATSVERIFYTOKEN
+    ) {
+      String hubChallenge = request.params.get('hub.challenge');
+      response.responseBody = Blob.valueOf(request.params.get('hub.challenge'));
+      System.debug('doGet ' + hubChallenge);
+    }
+  }
+
+  @HttpPost
+  global static void doPost() {
+    //The response that needs to be sent back to WhatsApp either Successful or failure
+    RestResponse response = RestContext.response;
+    System.debug('doPost ' + response);
+    //Response that needs to be sent back to WhatsApp should be in JSON format
+    response.addHeader('Content-Type', 'application/json');
+    //Request the body that is received from WhatsApp into a variable of type string
+    String responseString = RestContext.request.requestBody.toString();
+    System.debug('doPost ' + responseString);
+    //Additional headers thet we request from the WhatsApp-request should be in a Map format of key value pair
+    //Ex: X-Hub-Signature-256: sha256={super-long-SHA256-signature}
+    Map<String, String> headers = RestContext.request.headers;
+    System.debug('doPost ' + headers);
+    //Validate the signature of the request from WhatsApp by decrypting the
+    //SHA-256 signature with the secret value of the WhatsApp integration
+    //and then comparing the response string from the request with
+    //the response string from the JSON body of the request
+    //If the signature is valid then the request is sent to the method
+    //If the signature is invalid then the request is not processed and
+    //the response is sent back to WhatsApp with the status code 401
+    //Passing parameters for validateHubSignature as RestContext.request which is nothing but the Restrequest
+    //and the response string from the request body of the request
+    String responseValid = validateHubSignature(
+      RestContext.request,
+      responseString
+    );
+    System.debug('doPost ' + responseValid);
+
+    if (responseValid == 'Valid') {
+      System.debug(
+        System.LoggingLevel.DEBUG,
+        'Headers response from WhatsApp: ' + JSON.serialize(headers)
+      );
+
+      System.debug(
+        System.LoggingLevel.DEBUG,
+        'Body response from WhatsApp: ' + responseString
+      );
+
+      String finalResponseString = responseString.replace('type', 'typex');
+      System.debug('doPost ' + finalResponseString);
+
+      WhatsAppRestWrapperClass parentMessage = (WhatsAppRestWrapperClass) JSON.deserialize(
+        finalResponseString,
+        WhatsAppRestWrapperClass.class
+      );
+      System.debug('doPost ' + parentMessage);
+
+      List<WhatsAppRestWrapperClass.entry> messageEntries = parentMessage.entry;
+      if (messageEntries != null && messageEntries.size() > 0) {
+        WhatsAppRestWrapperClass.entry entryMessage = messageEntries.get(0);
+        List<WhatsAppRestWrapperClass.changes> changeMessages = entryMessage.changes;
+        if (changeMessages != null && changeMessages.size() > 0) {
+          WhatsAppRestWrapperClass.changes changeMessage = changeMessages.get(
+            0
+          );
+          List<WhatsAppRestWrapperClass.contacts> contactList = changeMessage.value.contacts;
+          List<WhatsAppRestWrapperClass.messages> messageList = changeMessage.value.messages;
+          WhatsAppRestWrapperClass.metadata metadata = changeMessage.value.metadata;
+
+          //Create Record in Salesforce
+          WhatsApp_Message__c salesforceMessage = new WhatsApp_Message__c();
+          salesforceMessage.Business_Phone_Number__c = metadata != null
+            ? metadata.display_phone_number
+            : null;
+
+          if (contactList != null && contactList.size() > 0) {
+            WhatsAppRestWrapperClass.contacts contact = contactList.get(0);
+            salesforceMessage.Customer_Phone__c = contact.wa_id;
+            salesforceMessage.Customer_Name__c = contact.profile.name;
+          }
+
+          if (messageList != null && messageList.size() > 0) {
+            //Just a text Message
+            WhatsAppRestWrapperClass.messages message = messageList.get(0);
+            salesforceMessage.Message_ID__c = message.id;
+            salesforceMessage.Message_Type__c = message.typex;
+            salesforceMessage.Message_Sent_Time__c = System.now();
+            salesforceMessage.Message_Content__c = message.text != null
+              ? message.text.body
+              : null;
+
+            //If message is Image
+            salesforceMessage.Image_ID__c = message.image != null
+              ? message.image.id
+              : null;
+            salesforceMessage.Image_Type__c = message.image != null
+              ? message.image.mime_typex
+              : null;
+            salesforceMessage.Image_SHA256__c = message.image != null
+              ? message.image.sha256
+              : null;
+
+            // If message is a reaction
+            salesforceMessage.Reaction__c = message.reaction != null &&
+              message.typex == 'reaction'
+              ? message.reaction.emoji
+              : null;
+            salesforceMessage.Parent_Message_ID__c = message.reaction != null &&
+              message.typex == 'reaction'
+              ? message.reaction.message_id
+              : salesforceMessage.Parent_Message_ID__c;
+
+            // If message is a document
+            salesforceMessage.Document_ID__c = message.document != null
+              ? message.document.id
+              : null;
+            salesforceMessage.Document_Type__c = message.document != null
+              ? message.document.mime_typex
+              : null;
+            salesforceMessage.Document_SHA256__c = message.document != null
+              ? message.document.sha256
+              : null;
+            salesforceMessage.Document_Filename__c = message.document != null
+              ? message.document.filename
+              : null;
+
+            String mediaId = message.document != null
+              ? message.document.id
+              : null;
+
+            // If the message is a reply to another message
+            salesforceMessage.Parent_Message_ID__c = message.context != null
+              ? message.context.id
+              : salesforceMessage.Parent_Message_ID__c;
+
+            System.debug('Parent ID ' + salesforceMessage.Parent_Message_ID__c);
+
+            upsert salesforceMessage Message_ID__c;
+
+            if (message.document != null) {
+              WhatsApp_Media_Event__e mediaEvent = new WhatsApp_Media_Event__e();
+              mediaEvent.MediaId__c = message.document.id;
+              mediaEvent.RecordId__c = salesforceMessage.Id;
+              mediaEvent.Customer_Phone_Number__c = null;
+              Database.SaveResult sr = EventBus.publish(mediaEvent);
+
+              if (sr.isSuccess()) {
+                System.debug('Event published successfully: ' + sr.getId());
+              } else {
+                System.debug(
+                  'Failed to publish event: ' + sr.getErrors()[0].getMessage()
+                );
+              }
+            } else {
+              // When the document is not present, still publish an event with different or minimal details
+              WhatsApp_Media_Event__e mediaEvent = new WhatsApp_Media_Event__e();
+              mediaEvent.MediaId__c = null; // Explicitly set to null or some placeholder if needed
+              mediaEvent.RecordId__c = salesforceMessage.Id;
+              mediaEvent.Customer_Phone_Number__c = salesforceMessage.Customer_Phone__c;
+              Database.SaveResult sr = EventBus.publish(mediaEvent);
+
+              if (sr.isSuccess()) {
+                System.debug('Event published successfully: ' + sr.getId());
+              } else {
+                System.debug(
+                  'Failed to publish event: ' + sr.getErrors()[0].getMessage()
+                );
+              }
+            }
+          }
+        }
+      } else {
+        response.responseBody = Blob.valueOf(
+          '{success:false, event:"Unknown", "message:"' + responseValid + '"}'
+        );
+        response.statusCode = 401;
+        return;
+      }
+
+      response.statusCode = 200;
+      response.responseBody = Blob.valueOf('{success:true, event:"success"}');
+    }
+  }
+
+  private static String validateHubSignature(
+    RestRequest request,
+    String responseString
+  ) {
+    Map<String, String> headers = request.headers;
+
+    String hubSignature = headers.get('X-Hub-Signature-256');
+
+    String whatsAppPayLoad = RestContext.request.requestBody.toString();
+
+    String whatsAppSecret = System.Label.WHATSAPPSECRET;
+    Blob signedPayLoad = Crypto.generateMac(
+      'HmacSHA256',
+      Blob.valueOf(whatsAppPayLoad),
+      Blob.valueOf(whatsAppSecret)
+    );
+
+    String encodedPayLoad =
+      'SHA256=' + EncodingUtil.convertToHex(signedPayLoad);
+
+    return (encodedPayLoad == hubSignature) ? 'Valid' : 'Invalid Signature';
+  }
+}
+
+
+
+//WrapperClass (Wrapper class for rest resource)
+
+public class WhatsAppRestWrapperClass {
+  public entry[] entry;
+
+  public class entry {
+    public String id;
+    public changes[] changes;
+  }
+
+  public class changes {
+    public value value;
+    public String field;
+  }
+
+  public class value {
+    public String messaging_product;
+    public metadata metadata;
+    public contacts[] contacts;
+    public messages[] messages;
+  }
+
+  public class metadata {
+    public String display_phone_number;
+    public String phone_number_id;
+  }
+
+  public class contacts {
+    public profile profile;
+    public String wa_id;
+  }
+
+  public class profile {
+    public String name;
+  }
+
+  public class messages {
+    public context context;
+    public String fromx;
+    public String id;
+    public String timestamp;
+    public text text;
+    public String typex;
+    public image image;
+    public image video;
+    public reaction reaction;
+    public document document;
+  }
+
+  public class context {
+    public String fromx;
+    public String id;
+  }
+
+  public class text {
+    public String body;
+  }
+
+  public class image {
+    public String mime_typex;
+    public String id;
+    public String sha256;
+  }
+
+  public class reaction {
+    public string emoji;
+    public string message_id;
+  }
+
+  public class document {
+    public String filename; //Coles_Low_Rate_Mastercard_4376_14072024.pdf
+    public String mime_typex; //application/pdf
+    public String sha256; //ItRn/nnLuWF4IMn1Ug8/3JzSwtO88cZm8gAPTQV8ank=
+    public String id; //1030874228432134
+  }
+}
+
+
+//Queueable Apex (To Process Documents from whatsapp)
+public class WhatsAppDocumentProcessor implements Queueable, Database.AllowsCallouts {
+  private String mediaId;
+  private Id recordId;
+
+  public WhatsAppDocumentProcessor(String mediaId, Id recordId) {
+    this.MediaId = mediaId;
+    this.RecordId = recordId;
+  }
+
+  public void execute(QueueableContext context) {
+    System.debug(
+      'Queueable execute started for MediaId: ' +
+        this.mediaId +
+        ', RecordId: ' +
+        this.recordId
+    );
+    WhatsAppCallOut.saveDocumentToSalesforce(this.mediaId, this.recordId);
+  }
+}
+
+
+//Callout (Sending message from Salesforce Whatsapp interface to the end user)
+public without sharing class WhatsAppCallOut {
+  public static WhatsApp_Message__c sendTextMessage(
+    String messageContent,
+    String toPhoneNumber
+  ) {
+    HttpRequest req = new HttpRequest();
+
+    //req.setEndpoint(
+    //   'callout:WhatsApp_Named_Cred/v20.0/293709137162139/messages'
+    // );
+    req.setEndpoint(
+      'https://graph.facebook.com/v20.0/293709137162139/messages'
+    );
+    req.setMethod('POST');
+    req.setHeader(
+      'Authorization',
+      'Bearer ' + System.label.WHATSAPPACCESSTOKEN
+    );
+    req.setHeader('Content-Type', 'application/json');
+
+    String jsonBody =
+      '{' +
+      '    "messaging_product": "whatsapp", ' +
+      '    "recipient_type": "individual", ' +
+      '    "to": "{{Recipient-Phone-Number}}", ' +
+      '    "type": "text", ' +
+      '    "text": { ' +
+      '        "preview_url": false, ' +
+      '        "body": "{{Body}}" ' +
+      '    } ' +
+      '} ';
+    jsonBody = jsonBody.replace('{{Recipient-Phone-Number}}', toPhoneNumber);
+    jsonBody = jsonBody.replace('{{Body}}', messageContent);
+    req.setBody(jsonBody);
+
+    Http http = new Http();
+    WhatsApp_Message__c salesforceMessage = new WhatsApp_Message__c();
+
+    try {
+      HttpResponse res = http.send(req);
+      if (res.getStatusCode() == 200) {
+        WhatsAppCallOut whatsappResponse = (WhatsAppCallOut) JSON.deserialize(
+          res.getBody(),
+          WhatsAppCallOut.class
+        );
+
+        salesforceMessage.Message_ID__c = whatsappResponse.messages[0].id;
+        salesforceMessage.Message_Type__c = 'text';
+        salesforceMessage.Message_Sent_Time__c = System.now();
+        salesforceMessage.Message_Content__c = messageContent;
+        salesforceMessage.Customer_Phone__c = toPhoneNumber;
+        salesforceMessage.Outgoing__c = true;
+        salesforceMessage.Agent_Name__c =
+          UserInfo.getFirstName() +
+          ' ' +
+          UserInfo.getLastName();
+
+        upsert salesforceMessage Message_ID__c;
+        System.debug(
+          'Salesforce message created or updated: ' + salesforceMessage
+        );
+      } else {
+        System.debug('HTTP Response Status Code: ' + res.getStatusCode());
+        System.debug('Response Body: ' + res.getBody());
+      }
+    } catch (System.CalloutException e) {
+      System.debug('Callout Exception: ' + e.getMessage());
+      System.debug(
+        'Callout Executed ' + e.getStackTraceString() + ' ' + e.getLineNumber()
+      );
+    } catch (Exception e) {
+      System.debug('General Exception: ' + e.getMessage());
+      System.debug(
+        'Exception Executed ' +
+          e.getStackTraceString() +
+          ' ' +
+          e.getLineNumber()
+      );
+    }
+    return salesforceMessage;
+  }
+
+  public static String getMediaUrl(String mediaId) {
+    HttpRequest req = new HttpRequest();
+    req.setEndpoint(
+      'https://graph.facebook.com/v20.0/' +
+        mediaId +
+        '?phone_number_id=293709137162139'
+    );
+    req.setMethod('GET');
+    req.setHeader(
+      'Authorization',
+      'Bearer ' + System.label.WHATSAPPACCESSTOKEN
+    );
+    req.setHeader('Content-Type', 'application/json');
+
+    Http http = new Http();
+    HttpResponse res = http.send(req);
+
+    if (res.getStatusCode() == 200) {
+      Map<String, Object> result = (Map<String, Object>) JSON.deserializeUntyped(
+        res.getBody()
+      );
+      string url = (String) result.get('url');
+      System.debug('URL: ' + url); // Debugging URL output
+      return url;
+    } else {
+      System.debug('Failed to retrieve media URL: ' + res.getBody());
+      return null;
+    }
+  }
+
+  public static void saveDocumentToSalesforce(String mediaId, Id recordId) {
+    String mediaUrl = getMediaUrl(mediaId);
+
+    // String protocol = mediaUrl.substring(0, mediaUrl.indexOf('://') + 3);
+    // String mediaUrlWithoutProtocol = mediaUrl.substring(
+    //   mediaUrl.indexOf('://') + 3
+    // );
+    // String mediaHost = mediaUrlWithoutProtocol.substring(
+    //   0,
+    //   mediaUrlWithoutProtocol.indexOf('/')
+    // );
+    // System.debug('Host: ' + mediaHost);
+
+    // String mediaPath = mediaUrlWithoutProtocol.substring(
+    //   mediaUrlWithoutProtocol.indexOf('/'),
+    //   mediaUrlWithoutProtocol.indexOf('?')
+    // );
+    // System.debug('Path: ' + mediaPath);
+
+    // String mediaQuery = mediaUrlWithoutProtocol.substring(
+    //   mediaUrlWithoutProtocol.indexOf('?') + 1
+    // );
+    // System.debug('Query: ' + mediaQuery);
+
+    // if (mediaUrl == null) {
+    //   System.debug('Failed to get media URL for document ID: ' + mediaId);
+    //   return;
+    // }
+
+    // if (mediaHost == 'lookaside.fbsbx.com') {
+    //   HttpRequest req = new HttpRequest();
+    //   req.setEndpoint(
+    //     'callout:WhatsApp_MediaURL_Named_Cred' + mediaPath + '?' + mediaQuery
+    //   );
+    HttpRequest req = new HttpRequest();
+    req.setMethod('GET');
+    req.setEndpoint(mediaUrl);
+    req.setHeader(
+      'Authorization',
+      'Bearer ' + System.label.WHATSAPPACCESSTOKEN
+    );
+    req.setHeader('Content-Type', 'application/json');
+
+    Http http = new Http();
+    HttpResponse res = http.send(req);
+
+    if (res.getStatusCode() == 200) {
+      ContentVersion cv = new ContentVersion();
+      cv.Title = 'WhatsApp Document';
+      cv.PathOnClient = 'WhatsApp_Document';
+      cv.VersionData = res.getBodyAsBlob();
+      cv.Origin = 'H';
+      cv.ContentLocation = 'S';
+      insert cv;
+
+      // Query ContentDocumentId from the inserted ContentVersion
+      ContentVersion insertedCv = [
+        SELECT ContentDocumentId
+        FROM ContentVersion
+        WHERE Id = :cv.Id
+        WITH SECURITY_ENFORCED
+        LIMIT 1
+      ];
+
+      if (insertedCv.ContentDocumentId != null) {
+        // Create ContentDocumentLink to link ContentDocument to the record
+        ContentDocumentLink link = new ContentDocumentLink();
+        link.ContentDocumentId = insertedCv.ContentDocumentId;
+        link.LinkedEntityId = recordId;
+        link.ShareType = 'V';
+        insert link;
+      } else {
+        System.debug(
+          'ContentDocumentId is null for ContentVersion Id: ' + cv.Id
+        );
+      }
+    } else {
+      System.debug('Failed to download document: ' + res.getBody());
+    }
+    //}
+  }
+
+  public String messaging_product;
+  public contacts[] contacts;
+  public messages[] messages;
+  public class contacts {
+    public String input;
+    public String wa_id;
+  }
+  public class messages {
+    public String id;
+  }
+}
+
+
+//Helper Apex class to pass Information to LWC for rendering
+public with sharing class WhatsAppLwcHelperClass {
+  @AuraEnabled
+  public static List<WhatsApp_Message__c> listAllMessages(
+    String customerPhone
+  ) {
+    List<WhatsApp_Message__c> allMessages = new List<WhatsApp_Message__c>();
+    try {
+      if (String.isEmpty(customerPhone)) {
+        throw new AuraHandledException(
+          'Customer phone number cannot be null or empty.'
+        );
+      }
+      allMessages = [
+        SELECT
+          Id,
+          Name,
+          Message_Content__c,
+          Message_Type__c,
+          Customer_Name__c,
+          Customer_Phone__c,
+          Agent_Name__c,
+          Outgoing__c,
+          Message_Sent_Time__c,
+          CreatedDate
+        FROM WhatsApp_Message__c
+        WHERE Customer_Phone__c = :customerPhone
+        ORDER BY CreatedDate ASC
+      ];
+      return allMessages;
+    } catch (Exception e) {
+      throw new AuraHandledException(e.getMessage());
+    }
+  }
+
+  @AuraEnabled
+  public static WhatsApp_Message__c sendTextMessage(
+    String messageContent,
+    String toPhoneNumber
+  ) {
+    WhatsApp_Message__c message = WhatsAppCallOut.sendTextMessage(
+      messageContent,
+      toPhoneNumber
+    );
+    try {
+      if (String.isEmpty(messageContent) || String.isEmpty(toPhoneNumber)) {
+        throw new AuraHandledException(
+          'Message content and phone number cannot be null or empty.'
+        );
+      }
+      return [
+        SELECT
+          Id,
+          Name,
+          Message_Content__c,
+          Message_Type__c,
+          Customer_Name__c,
+          Customer_Phone__c,
+          Agent_Name__c,
+          Outgoing__c,
+          Message_Sent_Time__c,
+          CreatedDate
+        FROM WhatsApp_Message__c
+        WHERE Id = :message.Id
+        ORDER BY CreatedDate ASC
+      ];
+    } catch (Exception e) {
+      throw new AuraHandledException(e.getMessage());
+    }
+  }
+
+  @AuraEnabled
+  public static WhatsApp_Message__c getIncomingMessage(
+    String recordId,
+    String customerPhone
+  ) {
+    try {
+      if (String.isEmpty(recordId) || String.isEmpty(customerPhone)) {
+        throw new AuraHandledException(
+          'Record ID and customer phone number cannot be null or empty.'
+        );
+      }
+      return [
+        SELECT
+          Id,
+          Name,
+          Message_Content__c,
+          Message_Type__c,
+          Customer_Name__c,
+          Customer_Phone__c,
+          Agent_Name__c,
+          Outgoing__c,
+          Message_Sent_Time__c,
+          CreatedDate
+        FROM WhatsApp_Message__c
+        WHERE Id = :recordId AND Customer_Phone__c = :customerPhone
+        ORDER BY CreatedDate ASC
+      ];
+    } catch (Exception e) {
+      throw new AuraHandledException(e.getMessage());
+    }
+  }
+
+  @AuraEnabled
+  public static SObject getCustomerPhoneDynamically(String query) {
+    try {
+      if (String.isEmpty(query)) {
+        throw new AuraHandledException('Query cannot be null or empty.');
+      }
+      return Database.query(query);
+    } catch (Exception e) {
+      throw new AuraHandledException(e.getMessage());
+    }
+  }
+}
+
+                
+//WhatsAPP LWC HTML 
+<template>
+    <lightning-card variant="Narrow">
+
+        <!-- Actions slot for buttons -->
+        <div slot="actions">
+            <template lwc:if={showChat}>
+                <lightning-button
+                    class="custom-button"
+                    label="End Chat"
+                    title="Chat with another customer"
+                    variant="brand"
+                    onclick={handleAnotherChat}></lightning-button>
+            </template>
+        </div>
+
+        <!-- Spinner -->
+        <template lwc:if={showSpinner}>
+            <div class="slds-spinner_container">
+                <lightning-spinner variant="brand"
+                    alternative-text="Loading"
+                    size="small"></lightning-spinner>
+            </div>
+        </template>
+
+        <!-- Phone and Button -->
+        <template lwc:if={showPhoneAndButton}>
+            <div class="slds-var-p-around_small">
+                <p>
+                    <lightning-input
+                        class="phone-Input"
+                        type="tel"
+                        placeholder="Enter Customer Phone number"
+                        label="Enter Customer Number"
+                        value={phone}
+                        variant="label-hidden"
+                        name="phone" required
+                        message-when-value-missing="Please enter customer phone number to open chat"
+                        onchange={handlePhoneChange}></lightning-input>
+                </p>
+                <p class="slds-var-m-top_x-small">
+                    <lightning-button
+                        variant="brand"
+                        label="Start Chatting"
+                        onclick={handleChat}></lightning-button>
+                </p>
+            </div>
+        </template>
+
+        <!-- Chat messages Outbound -->
+        <template lwc:if={showChat}>
+            <section role="log"
+                class="slds-chat slds-scrollable_y chatArea"
+                style="height: 300px">
+                <ul class="slds-chat-list">
+                    <template for:each={messages}
+                        for:item="message">
+                        <template
+                            lwc:if={message.Outgoing__c}>
+                            <li key={message.Id}
+                                class="slds-chat-listitem slds-chat-listitem_outbound">
+                                <div
+                                    class="slds-chat-message">
+                                    <span
+                                        aria-hidden="true"
+                                        class="slds-avatar slds-avatar_circle slds-chat-avatar">
+                                        <abbr
+                                            class="slds-avatar__initials slds-icon-standard-user"
+                                            title={message.Agent_Name__c}>{message.initials}</abbr>
+                                    </span>
+                                    <div
+                                        class="slds-chat-message__body">
+                                        <div
+                                            class="slds-chat-message__text slds-chat-message__text_outbound">
+                                            <lightning-formatted-rich-text
+                                                value={message.Message_Content__c}></lightning-formatted-rich-text>
+                                        </div>
+                                        <div
+                                            class="slds-chat-message__meta">
+                                            {message.Agent_Name__c}
+                                            -
+                                            <lightning-formatted-date-time
+                                                value={message.CreatedDate}
+                                                year="2-digit"
+                                                month="short"
+                                                day="2-digit"
+                                                hour="numeric"
+                                                minute="2-digit"
+                                                weekday="long"></lightning-formatted-date-time>
+                                        </div>
+                                    </div>
+                                </div>
+                            </li>
+                        </template>
+
+                        <!-- Chat messages Inbound -->
+                        <template lwc:else>
+                            <li key={message.Id}
+                                class="slds-chat-listitem slds-chat-listitem_inbound">
+                                <div
+                                    class="slds-chat-message">
+                                    <span
+                                        aria-hidden="true"
+                                        class="slds-avatar slds-avatar_circle slds-chat-avatar">
+                                        <abbr
+                                            class="slds-avatar__initials slds-avatar__initials_inverse"
+                                            title={message.Customer_Name__c}>{message.initials}</abbr>
+                                    </span>
+                                    <div
+                                        class="slds-chat-message__body">
+                                        <div
+                                            class="slds-chat-message__text slds-chat-message__text_inbound">
+                                            <lightning-formatted-rich-text
+                                                value={message.Message_Content__c}></lightning-formatted-rich-text>
+                                        </div>
+                                        <div
+                                            class="slds-chat-message__meta">
+                                            {message.Customer_Name__c}
+                                            -
+                                            <lightning-formatted-date-time
+                                                value={message.CreatedDate}
+                                                year="2-digit"
+                                                month="short"
+                                                day="2-digit"
+                                                hour="numeric"
+                                                minute="2-digit"
+                                                weekday="long"></lightning-formatted-date-time>
+                                        </div>
+                                    </div>
+                                </div>
+                            </li>
+                        </template>
+                    </template>
+                </ul>
+            </section>
+
+            <!-- Chat Icon, Input and Button -->
+            <div>
+                <lightning-icon
+                    icon-name="standard:live_chat"
+                    alternative-text="live_chat"
+                    size="small" title=""
+                    aria-hidden="true"></lightning-icon>
+                <div class="slds-grid slds-wrap">
+                    <p
+                        class="slds-col slds-size_11-of-12 slds-medium-size_11-of-12 slds-large-size_11-of-12 
+                     slds-flex slds-align-middle slds-vertical-align">
+                        <span>
+                            <lightning-textarea
+                                class="chat-Input"
+                                type="text"
+                                value={messageText}
+                                placeholder="Enter Chat message"
+                                label="Enter your message"
+                                variant="label-hidden"
+                                onchange={handleChange}
+                                name="chat"
+                                message-when-value-missing="Enter a valid message to send"
+                                required>
+                            </lightning-textarea>
+                        </span>
+                    </p>
+                    <p
+                        class="slds-col slds-size_1-of-12 slds-medium-size_1-of-12 slds-large-size_1-of-12 
+                    slds-var-p-right_xx-small slds-flex slds-align-middle slds-vertical-align">
+                        <span>
+                            <lightning-button-icon
+                                icon-name="utility:send"
+                                class="buttonIcon"
+                                alternative-text="send"
+                                size='large'
+                                title="send"
+                                onclick={handleSendMessage}>
+                            </lightning-button-icon>
+                        </span>
+                    </p>
+                </div>
+            </div>
+        </template>
+
+        <!-- Footer -->
+        <div class="footer-container">
+            <div slot="footer" class="footer">
+                Empowering conversations with
+                <a href="http://passion-led-me-here-dev-ed.trailblaze.my.site.com/PortfolioVoyage/s/"
+                    target="_blank"
+                    aria-label="PK"> Passion
+                </a>
+            </div>
+        </div>
+
+    </lightning-card>
+</template>
+
+
+//WhatsApp LWC Javascript
+import { LightningElement, track, api } from "lwc";
+import LISTALLMESSAGES from "@salesforce/apex/WhatsAppLwcHelperClass.listAllMessages";
+import SENDTEXTMESSAGE from "@salesforce/apex/WhatsAppLwcHelperClass.sendTextMessage";
+import GETINCOMINGMESSAGE from "@salesforce/apex/WhatsAppLwcHelperClass.getIncomingMessage";
+import { subscribe, unsubscribe, onError } from "lightning/empApi";
+import GETCUSTOMERPHONEDYNAMICALLY from "@salesforce/apex/WhatsAppLwcHelperClass.getCustomerPhoneDynamically";
+
+export default class WhatsAppChatComponent extends LightningElement {
+  @api recordId;
+  @api objectApiName;
+
+  @track messages = [];
+  @track error;
+
+  showSpinner = false;
+  showChat = false;
+  showPhoneAndButton = true;
+  phone;
+  messageText = "";
+  queryString;
+
+  channelName = "/event/WhatsApp_Media_Event__e";
+
+  subscription = {};
+
+  handlePhoneChange(event) {
+    event.preventDefault();
+    this.phone = event.target.value;
+    console.log(
+      "🚀 ~ WhatsAppChatComponent ~ handlePhoneChange ~ this.phone:",
+      this.phone
+    );
+  }
+
+  handleChat(event) {
+    if (event) {
+      event.preventDefault();
+    }
+    if (this.handleValidate()) {
+      this.handleListAllMessages();
+    }
+  }
+
+  handleChange(event) {
+    event.preventDefault();
+    this.messageText = event.target.value;
+    console.log("Message text changed:", this.messageText);
+  }
+
+  handleAnotherChat() {
+    this.showPhoneAndButton = true;
+    this.showChat = false;
+    this.phone = "";
+    this.messageText = "";
+    this.messages = [];
+    this.isRendered = false;
+  }
+
+  handleValidate() {
+    const phoneInput = this.template.querySelector(".phone-Input");
+    // If there is no phone input, return true (assuming this is not expected)
+    if (!phoneInput) {
+      return true;
+    }
+
+    // If the phone number is invalid, set custom validity and return false
+    if (this.phone && !this.isValidAustralianPhoneNumber(this.phone)) {
+      phoneInput.setCustomValidity(
+        "Please enter a valid Australian phone number"
+      );
+      phoneInput.reportValidity();
+      return false;
+    }
+    // If the phone number is valid, clear the custom validity
+    phoneInput.setCustomValidity("");
+
+    return [
+      ...this.template.querySelectorAll("lightning-input, lightning-textarea")
+    ].reduce((validSoFar, inputCmp) => {
+      inputCmp.reportValidity();
+      return validSoFar && inputCmp.checkValidity();
+    }, true);
+  }
+
+  isValidAustralianPhoneNumber(phone) {
+    // Regular expression to match Australian phone numbers
+    const australianPhonePattern = /^(\+61|61)?\d{9}$/;
+    const isValid = australianPhonePattern.test(phone);
+    console.log("Is phone number valid:", isValid);
+    return isValid;
+  }
+
+  //Get the agent Name and return the initials
+  getInitials(name) {
+    if (!name) return "";
+    const names = name.split(" ");
+    if (names.length === 1) {
+      return names[0].charAt(0).toUpperCase();
+    }
+    return names.map((n) => n.charAt(0).toUpperCase()).join("");
+  }
+
+  chatArea() {
+    let chatArea = this.template.querySelector(".chatArea");
+    if (chatArea) {
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+  }
+
+  renderedCallback() {
+    if (this.isRendered) {
+      return;
+    }
+    this.isRendered = true;
+    this.setUpChatMessage();
+  }
+
+  setUpChatMessage() {
+    console.log("Setting up chat message event listener");
+    let chatInput = this.template.querySelector(".chat-Input");
+    let phoneInputScreen = this.template.querySelector(".phone-Input");
+
+    if (chatInput) {
+      chatInput.addEventListener("keydown", (event) => {
+        console.log(`Enent handler added`);
+        if (event.key === "Enter") {
+          event.preventDefault();
+          this.handleSendMessage();
+        }
+      });
+    }
+
+    if (phoneInputScreen) {
+      phoneInputScreen.addEventListener("keydown", (event) => {
+        console.log(`Enent handler added`);
+        if (event.key === "Enter") {
+          event.preventDefault();
+          this.handleChat();
+        }
+      });
+    }
+  }
+
+  handleListAllMessages() {
+    this.showSpinner = true;
+    LISTALLMESSAGES({ customerPhone: this.phone })
+      .then((result) => {
+        console.log("🚀 ~ Validation passed, calling LISTALLMESSAGES");
+        this.messages = result.map((item) => {
+          return {
+            ...item,
+            initials: item.Outgoing__c
+              ? this.getInitials(item.Agent_Name__c)
+              : this.getInitials(item.Customer_Name__c)
+          };
+        });
+        this.showChat = true;
+        this.showPhoneAndButton = false;
+      })
+      .catch((error) => {
+        this.error = error;
+        this.showChat = false;
+        this.showPhoneAndButton = true;
+        console.log(error);
+      })
+      .finally(() => {
+        this.chatArea();
+        this.showSpinner = false;
+        this.setUpChatMessage();
+      });
+  }
+
+  handleSendMessage() {
+    console.log("Handle send message triggered");
+    if (this.handleValidate() && this.messageText.trim()) {
+      console.log("Validation passed, calling SENDTEXTMESSAGE");
+      this.showSpinner = true;
+      SENDTEXTMESSAGE({
+        messageContent: this.messageText,
+        toPhoneNumber: this.phone
+      })
+        .then((result) => {
+          console.log("SENDTEXTMESSAGE result:", result);
+          this.messages = [
+            ...this.messages,
+            {
+              ...result,
+              initials: result.Outgoing__c
+                ? this.getInitials(result.Agent_Name__c)
+                : this.getInitials(result.Customer_Name__c)
+            }
+          ];
+        })
+        .catch((error) => {
+          this.error = error;
+          this.showChat = false;
+        })
+        .finally(() => {
+          this.chatArea();
+          this.messageText = "";
+          this.showSpinner = false;
+        });
+    }
+  }
+
+  connectedCallback() {
+    console.log("Connected Callback - RecordId:", this.recordId);
+    console.log("Connected Callback - ObjectApiName:", this.objectApiName);
+
+    if (this.objectApiName === "Account") {
+      this.queryString = `SELECT Id, Phone from Account WHERE Id = '${this.recordId}'`;
+    } else if (this.objectApiName === "Contact") {
+      this.queryString = `SELECT Id, Phone from Contact WHERE Id = '${this.recordId}'`;
+    } else if (this.objectApiName === "Lead") {
+      this.queryString = `SELECT Id, Phone from Lead WHERE Id = '${this.recordId}'`;
+    } else if (this.objectApiName === "Opportunity") {
+      this.queryString = `SELECT Id, Phone from Opportunity WHERE Id = '${this.recordId}'`;
+    } else if (this.objectApiName === "Case") {
+      this.queryString = `SELECT Id, Phone from Case WHERE Id = '${this.recordId}'`;
+    } else if (this.objectApiName === "WhatsApp_Message__c") {
+      this.queryString = `SELECT Id, Customer_Phone__c from WhatsApp_Message__c WHERE Id = '${this.recordId}'`;
+    }
+
+    if (this.recordId && this.objectApiName) {
+      this.handleCustomerPhoneDynamically();
+    } else {
+      console.error("RecordId or objectApiName is missing.");
+    }
+
+    this.handleSubscribe();
+    // Register error listener
+    this.registerErrorListener();
+  }
+
+  handleCustomerPhoneDynamically() {
+    GETCUSTOMERPHONEDYNAMICALLY({
+      query: this.queryString
+    })
+      .then((response) => {
+        this.phone =
+          this.objectApiName === "WhatsApp_Message__c"
+            ? response.Customer_Phone__c
+            : response.Phone;
+
+        console.log("Phone number set to:", this.phone);
+        console.log(
+          "🚀 ~ WhatsAppChatComponent ~ .then ~ this.recordId:",
+          this.recordId
+        );
+        this.handleListAllMessages();
+      })
+      .catch((error) => {
+        this.error = error;
+        console.log(
+          "🚀 ~ WhatsAppChatComponent ~ handleCustomerPhoneDynamically ~ error:",
+          error
+        );
+      })
+      .finally(() => {
+        console.log(
+          "🚀 ~ WhatsAppChatComponent ~ handleCustomerPhoneDynamically ~ finally:"
+        );
+      });
+  }
+
+  disconnectedCallback() {
+    console.log("DisconnectedCallback triggered");
+    // Unsubscribe from the channel
+    unsubscribe(this.subscription, (response) => {
+      console.log("Unsubscribe response: ", JSON.stringify(response));
+    });
+    // Unregister error listener
+    onError((error) => {
+      console.log("Error: ", JSON.stringify(error));
+    });
+  }
+
+  registerErrorListener() {
+    onError((error) => {
+      console.log("Error: ", JSON.stringify(error));
+    });
+  }
+
+  // Handles subscribe button click
+  handleSubscribe() {
+    // Callback invoked whenever a new event message is received
+    const messageCallback = (response) => {
+      console.log("WhatsApp Webhook: ", JSON.stringify(response));
+      let data = response.data.payload;
+      let messageId = data.RecordId__c;
+      let customerPhone = data.Customer_Phone_Number__c;
+      if (this.phone === customerPhone) {
+        //Make Apex call
+        GETINCOMINGMESSAGE({
+          recordId: messageId,
+          customerPhone: customerPhone
+        })
+          .then((result) => {
+            console.log("GETINCOMINGMESSAGE result:", result);
+            // Process the result as a single object
+            this.messages = [
+              ...this.messages,
+              {
+                ...result,
+                initials: result.Outgoing__c
+                  ? this.getInitials(result.Agent_Name__c)
+                  : this.getInitials(result.Customer_Name__c)
+              }
+            ];
+            console.log(
+              "🚀 ~ WhatsAppChatComponent ~ .then ~ this.messages:",
+              this.messages
+            );
+          })
+          .catch((error) => {
+            this.error = error;
+            this.showChat = false;
+          })
+          .finally(() => {
+            this.chatArea();
+            this.showSpinner = false;
+          });
+      }
+    };
+
+    // Invoke subscribe method of empApi. Pass reference to messageCallback
+    subscribe(this.channelName, -1, messageCallback).then((response) => {
+      // Response contains the subscription information on subscribe call
+      console.log(
+        "Subscription request sent to: ",
+        JSON.stringify(response.channel)
+      );
+      this.subscription = response;
+    });
+  }
+}
